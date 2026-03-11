@@ -1,0 +1,58 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * { box-sizing: border-box; }
+
+  body {
+    @apply bg-farm-bg text-farm-text font-sans;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-farm-bg; }
+  ::-webkit-scrollbar-thumb { @apply bg-farm-border rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-farm-muted; }
+}
+
+@layer components {
+  .card {
+    @apply bg-farm-surface border border-farm-border rounded-xl p-4;
+  }
+  .btn {
+    @apply inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium
+           transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed
+           focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-farm-bg;
+  }
+  .btn-primary   { @apply btn bg-farm-blue/20 text-farm-blue border border-farm-blue/40 hover:bg-farm-blue/30 focus:ring-farm-blue; }
+  .btn-success   { @apply btn bg-farm-green/20 text-farm-green border border-farm-green/40 hover:bg-farm-green/30 focus:ring-farm-green; }
+  .btn-danger    { @apply btn bg-farm-red/20 text-farm-red border border-farm-red/40 hover:bg-farm-red/30 focus:ring-farm-red; }
+  .btn-warning   { @apply btn bg-farm-yellow/20 text-farm-yellow border border-farm-yellow/40 hover:bg-farm-yellow/30 focus:ring-farm-yellow; }
+  .btn-ghost     { @apply btn bg-transparent text-farm-muted border border-farm-border hover:bg-farm-border hover:text-farm-text focus:ring-farm-border; }
+
+  .badge {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium;
+  }
+  .badge-running  { @apply badge bg-farm-green/15 text-farm-green; }
+  .badge-stopped  { @apply badge bg-farm-muted/15 text-farm-muted; }
+  .badge-starting { @apply badge bg-farm-yellow/15 text-farm-yellow; }
+  .badge-error    { @apply badge bg-farm-red/15 text-farm-red; }
+  .badge-creating { @apply badge bg-farm-blue/15 text-farm-blue; }
+
+  .input {
+    @apply w-full bg-farm-bg border border-farm-border rounded-lg px-3 py-2 text-sm
+           text-farm-text placeholder-farm-muted
+           focus:outline-none focus:ring-2 focus:ring-farm-blue/50 focus:border-farm-blue/50
+           transition-colors duration-150;
+  }
+
+  .select {
+    @apply input appearance-none cursor-pointer;
+  }
+
+  .label {
+    @apply block text-xs text-farm-muted font-medium mb-1;
+  }
+}
