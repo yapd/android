@@ -3,6 +3,7 @@ const router = express.Router();
 const { getSystemMetrics, getAdbDevices } = require('../controllers/systemController');
 
 router.get('/metrics',  getSystemMetrics);
+router.get('/status',   getSystemMetrics);   // alias
 router.get('/devices',  getAdbDevices);
 
 module.exports = router;

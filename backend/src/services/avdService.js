@@ -1,53 +1,49 @@
 /**
- * AVD Service — Gerenciamento de Android Virtual Devices
- * Orquestra criação, start, stop e spoofing de emuladores.
+ * AVD Service — Android Virtual Devices via Redroid (Docker)
+ * ARM64 host: docker run redroid/redroid:13.0.0-latest
+ *
+ * Redroid requirements (host):
+ *   modprobe binder_linux
+ *   mount -t binder binder /dev/binderfs
+ *
+ * Key design decisions:
+ *  - ro.* props injected as docker run CMD args (NOT setprop — read-only after boot)
+ *  - androidboot.qemu=0 ALWAYS set to avoid QEMU/emulator detection
+ *  - androidboot.redroid_gpu_mode=guest for headless/CI environments (no GPU needed)
+ *  - Boot timeout 10 min (first boot initialises /data, takes longer)
+ *  - GSM spoofing via setprop gsm.* (writable at runtime)
+ *  - Battery via `dumpsys battery set`
+ *  - GPS via LocationManager mock broadcast
+ *  - SMS via android.provider.Telephony.SMS_RECEIVED broadcast
  */
+
 const { exec, spawn } = require('child_process');
-const { promisify } = require('util');
-const path = require('path');
-const fs = require('fs');
-const net = require('net');
+const { promisify }   = require('util');
+const path  = require('path');
+const fs    = require('fs');
+const net   = require('net');
 const logger = require('../utils/logger');
 
 const execAsync = promisify(exec);
 
-const SDK_ROOT  = process.env.ANDROID_SDK_ROOT || '/opt/android-farm/sdk';
-const AVD_HOME  = process.env.ANDROID_AVD_HOME || '/opt/android-farm/avds';
 const FARM_DIR  = process.env.FARM_BASE_DIR    || '/opt/android-farm';
+const ADB       = path.join(
+  process.env.ANDROID_SDK_ROOT || '/opt/android-farm/sdk',
+  'platform-tools/adb'
+);
 
-const SDKMANAGER = path.join(SDK_ROOT, 'cmdline-tools/latest/bin/sdkmanager');
-const AVDMANAGER = path.join(SDK_ROOT, 'cmdline-tools/latest/bin/avdmanager');
-const EMULATOR   = path.join(SDK_ROOT, 'emulator/emulator');
-const ADB        = path.join(SDK_ROOT, 'platform-tools/adb');
+// Redroid Docker image
+const REDROID_IMAGE  = process.env.REDROID_IMAGE  || 'redroid/redroid:13.0.0-latest';
+const REDROID_PREFIX = 'redroid-farm';
 
-const SYSTEM_IMAGE = 'system-images;android-33;google_apis_playstore;arm64-v8a';
-const BASE_PORT    = parseInt(process.env.EMULATOR_BASE_PORT || '5554', 10);
-const MAX_INSTANCES = parseInt(process.env.MAX_INSTANCES || '20', 10);
+// ADB port base
+const BASE_ADB_PORT = parseInt(process.env.EMULATOR_BASE_PORT || '5554', 10);
+const MAX_INSTANCES = parseInt(process.env.MAX_INSTANCES      || '20',   10);
 
-// Mapa de processos em execução: instanceId → ChildProcess
+// Map instanceId → { containerId, adbPort }
 const runningProcesses = new Map();
 
-// ─── Utilitários ──────────────────────────────────────────────────────────────
-function getEnv() {
-  return {
-    ...process.env,
-    ANDROID_SDK_ROOT: SDK_ROOT,
-    ANDROID_HOME: SDK_ROOT,
-    ANDROID_AVD_HOME: AVD_HOME,
-    JAVA_HOME: process.env.JAVA_HOME || '/usr/lib/jvm/java-17-openjdk-arm64',
-    PATH: `${SDK_ROOT}/cmdline-tools/latest/bin:${SDK_ROOT}/emulator:${SDK_ROOT}/platform-tools:${process.env.PATH}`,
-  };
-}
-
-async function findFreePort(start = BASE_PORT) {
-  // Portas do emulador são sempre pares (console+adb)
-  for (let p = start; p < start + MAX_INSTANCES * 2; p += 2) {
-    const free = await isPortFree(p);
-    if (free) return p;
-  }
-  throw new Error('Nenhuma porta livre disponível para o emulador.');
-}
-
+// ─── Port utilities ───────────────────────────────────────────────────────────
 function isPortFree(port) {
   return new Promise((resolve) => {
     const srv = net.createServer();
@@ -57,315 +53,336 @@ function isPortFree(port) {
   });
 }
 
-async function waitForEmulatorBoot(port, timeoutMs = 300000) {
-  const adbSerial = `emulator-${port}`;
-  const deadline = Date.now() + timeoutMs;
-  logger.info(`[AVD] Aguardando boot do emulador ${adbSerial}...`);
+async function findFreePort(start = BASE_ADB_PORT) {
+  for (let p = start; p < start + MAX_INSTANCES * 2; p += 1) {
+    if (await isPortFree(p)) return p;
+  }
+  throw new Error('No free ADB port available.');
+}
+
+// ─── Kernel modules (binder required by Redroid) ─────────────────────────────
+async function ensureKernelModules() {
+  try {
+    await execAsync('modprobe binder_linux 2>/dev/null; modprobe ashmem_linux 2>/dev/null; true');
+    const { stdout: mounts } = await execAsync('mount | grep binder || true');
+    if (!mounts.includes('binder')) {
+      await execAsync('mkdir -p /dev/binderfs && mount -t binder binder /dev/binderfs 2>/dev/null || true');
+    }
+  } catch (e) {
+    logger.warn(`[Redroid] kernel module hint: ${e.message}`);
+  }
+}
+
+// ─── Wait for Android to boot via ADB ────────────────────────────────────────
+async function waitForEmulatorBoot(adbPort, timeoutMs = 600000) {
+  const adbSerial = `127.0.0.1:${adbPort}`;
+  const deadline  = Date.now() + timeoutMs;
+  logger.info(`[Redroid] Aguardando ADB ${adbSerial} (timeout ${timeoutMs / 1000}s)...`);
 
   while (Date.now() < deadline) {
     try {
+      await execAsync(`${ADB} connect ${adbSerial}`, { timeout: 8000 });
       const { stdout } = await execAsync(
         `${ADB} -s ${adbSerial} shell getprop sys.boot_completed`,
-        { env: getEnv(), timeout: 10000 }
+        { timeout: 10000 }
       );
       if (stdout.trim() === '1') {
-        logger.info(`[AVD] Emulador ${adbSerial} bootou com sucesso!`);
-        return true;
+        logger.info(`[Redroid] Dispositivo ${adbSerial} iniciado com sucesso!`);
+        return adbSerial;
       }
-    } catch (_) {
-      // ainda aguardando
-    }
-    await new Promise((r) => setTimeout(r, 3000));
+    } catch (_) { /* ainda inicializando */ }
+    await new Promise(r => setTimeout(r, 5000));
   }
   throw new Error(`Timeout aguardando boot do emulador ${adbSerial}`);
 }
 
-// ─── Criação do AVD ───────────────────────────────────────────────────────────
+// ─── Container name ───────────────────────────────────────────────────────────
+function containerName(instanceId) {
+  return `${REDROID_PREFIX}-${instanceId.replace(/-/g, '').slice(0, 12)}`;
+}
+
+// ─── createAVD (no-op para Redroid) ──────────────────────────────────────────
 async function createAVD(instanceId, name, profile) {
   const avdName = `farm_${instanceId.replace(/-/g, '_')}`;
-  const avdDir  = path.join(AVD_HOME, `${avdName}.avd`);
-
-  logger.info(`[AVD] Criando AVD: ${avdName} (perfil: ${profile.id})`);
-
-  // Cria o AVD via avdmanager
-  const cmd = [
-    AVDMANAGER, '--silent', 'create', 'avd',
-    '--name', avdName,
-    '--package', SYSTEM_IMAGE,
-    '--device', profile.avdDevice || 'pixel_6',
-    '--force',
-    '--path', avdDir,
-  ].join(' ');
-
-  await execAsync(`echo "no" | ${cmd}`, { env: getEnv(), timeout: 120000 });
-  logger.info(`[AVD] AVD ${avdName} criado em ${avdDir}`);
-
-  // ── Aplicar config.ini do perfil ─────────────────────────────────────────
-  await applyConfigIni(avdName, avdDir, profile);
-
-  return { avdName, avdDir };
+  logger.info(`[Redroid] Slot AVD pronto: ${avdName} (perfil: ${profile.id || profile.label})`);
+  return { avdName, avdDir: path.join(FARM_DIR, 'instances', instanceId) };
 }
 
-async function applyConfigIni(avdName, avdDir, profile) {
-  const configPath = path.join(avdDir, 'config.ini');
+async function applyConfigIni(_avdName, _avdDir, _profile) { /* no-op */ }
 
-  // Lê config existente
-  let config = '';
-  if (fs.existsSync(configPath)) {
-    config = fs.readFileSync(configPath, 'utf8');
-  }
+// ─── Build Samsung S23 docker args from profile ───────────────────────────────
+function buildDockerArgs(adbPort, instanceId, profile) {
+  const cname      = containerName(instanceId);
+  // Named Docker volume: avoids host UID issues that slow first-boot data init
+  const volumeName = `redroid-data-${instanceId.replace(/-/g, '').slice(0, 12)}`;
 
-  const overrides = {
-    'hw.device.name':    profile.avdDevice || 'pixel_6',
-    'hw.ramSize':        String(profile.ram || 4096),
-    'hw.gpu.enabled':    'yes',
-    'hw.gpu.mode':       'swiftshader_indirect',
-    'hw.keyboard':       'yes',
-    'hw.sensors.proximity':     'yes',
-    'hw.sensors.accelerometer': 'yes',
-    'hw.sensors.gyroscope':     'yes',
-    'hw.sensors.magnetic_field':'yes',
-    'hw.gsmModem':       'yes',
-    'hw.gps':            'yes',
-    'hw.battery':        'yes',
-    'hw.camera.back':    'emulated',
-    'hw.camera.front':   'emulated',
-    'disk.dataPartition.size': '8192M',
-    // Tela
-    'hw.lcd.width':      String(profile.screenWidth || 1080),
-    'hw.lcd.height':     String(profile.screenHeight || 1920),
-    'hw.lcd.density':    String(profile.screenDpi || 420),
-    // Spoofing de fabricante a nível de config
-    'hw.product.manufacturer': profile.manufacturer,
-    'hw.product.model':        profile.model,
-  };
-
-  // Parse e merge no config.ini
-  const lines = config.split('\n');
-  const configMap = {};
-  for (const line of lines) {
-    const match = line.match(/^([^=]+)=(.*)$/);
-    if (match) configMap[match[1].trim()] = match[2].trim();
-  }
-
-  const merged = { ...configMap, ...overrides };
-  const newConfig = Object.entries(merged)
-    .map(([k, v]) => `${k}=${v}`)
-    .join('\n') + '\n';
-
-  fs.writeFileSync(configPath, newConfig, 'utf8');
-  logger.info(`[AVD] config.ini aplicado para ${avdName}`);
-}
-
-// ─── Iniciar Emulador ─────────────────────────────────────────────────────────
-async function startEmulator(instanceId, avdName, emulatorPort) {
-  logger.info(`[AVD] Iniciando emulador ${avdName} na porta ${emulatorPort}...`);
+  // Base props from profile buildProps (injected as CMD args for read-only props)
+  const props = profile.buildProps || {};
 
   const args = [
-    '-avd', avdName,
-    '-port', String(emulatorPort),
-    '-no-window',
-    '-no-audio',
-    '-no-boot-anim',
-    '-gpu', 'swiftshader_indirect',
-    '-memory', '4096',
-    '-cores', '2',
-    '-accel', 'auto',
-    '-no-snapshot-save',
+    'run', '-d',
+    '--name', cname,
+    '--privileged',
+    // Use Docker named volume for /data — much faster first-boot than host bind
+    '-v', `${volumeName}:/data`,
+    // Binder (required for Redroid)
+    '-v', '/dev/binderfs:/dev/binderfs',
+    // Port: host adbPort → container 5555
+    '-p', `127.0.0.1:${adbPort}:5555`,
+    // Memory limit
+    '--memory', '3g',
+    '--memory-swap', '3g',
+    REDROID_IMAGE,
+    // ─── Android boot params ──────────────────────────────────────────────
+    'androidboot.hardware=redroid',
+    'androidboot.redroid_width=1080',
+    'androidboot.redroid_height=1920',
+    'androidboot.redroid_density=420',
+    // CRITICAL: qemu=0 prevents emulator detection by apps
+    'androidboot.qemu=0',
+    // Use guest/software GPU (no physical GPU needed, works headless)
+    'androidboot.redroid_gpu_mode=guest',
   ];
 
-  const proc = spawn(EMULATOR, args, {
-    env: getEnv(),
-    detached: false,
+  // Inject all ro.* build props as docker CMD args
+  for (const [k, v] of Object.entries(props)) {
+    args.push(`${k}=${v}`);
+  }
+
+  return args;
+}
+
+// ─── Start Redroid Container ──────────────────────────────────────────────────
+async function startEmulator(instanceId, avdName, adbPort, profileArg) {
+  logger.info(`[Redroid] Iniciando container para ${avdName}, porta ADB ${adbPort}...`);
+  await ensureKernelModules();
+
+  const cname = containerName(instanceId);
+
+  // Remove stale container if exists
+  try { await execAsync(`docker rm -f ${cname} 2>/dev/null || true`); } catch (_) {}
+
+  // Default Samsung S23 profile if none provided
+  const defaultProfile = {
+    buildProps: {
+      'ro.product.brand':            'samsung',
+      'ro.product.manufacturer':     'samsung',
+      'ro.product.model':            'SM-S911B',
+      'ro.product.name':             'dm1q',
+      'ro.product.device':           'dm1q',
+      'ro.product.board':            'kalama',
+      'ro.hardware':                 'qcom',
+      'ro.build.fingerprint':        'samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXU3CWC1:user/release-keys',
+      'ro.build.description':        'dm1q-user 13 TP1A.220624.014 S911BXXU3CWC1 release-keys',
+      'ro.build.display.id':         'TP1A.220624.014.S911BXXU3CWC1',
+      'ro.build.id':                 'TP1A.220624.014',
+      'ro.build.version.incremental':'S911BXXU3CWC1',
+      'ro.build.tags':               'release-keys',
+      'ro.build.type':               'user',
+      'ro.build.user':               'dpi',
+      'ro.build.host':               'SWDK9605',
+      'ro.build.flavor':             'dm1qxxx-user',
+      'ro.boot.hardware':            'qcom',
+      'ro.product.cpu.abi':          'arm64-v8a',
+    }
+  };
+
+  // Use passed profile, fallback to store lookup, then default
+  let profile = profileArg || defaultProfile;
+  if (!profile.buildProps) {
+    try {
+      const store = require('../models/instanceStore');
+      const inst  = store.getAll().find(i => i.avdName === avdName);
+      if (inst && inst.profile && inst.profile.buildProps) profile = inst.profile;
+      else profile = defaultProfile;
+    } catch (_) { profile = defaultProfile; }
+  }
+
+  const args = buildDockerArgs(adbPort, instanceId, profile);
+
+  logger.debug(`[Redroid] docker ${args.join(' ')}`);
+
+  const proc = spawn('docker', args, {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
-  runningProcesses.set(instanceId, proc);
+  let containerId = '';
+  proc.stdout.on('data', d => { containerId += d.toString().trim(); });
+  proc.stderr.on('data', d => logger.debug(`[Redroid] stderr: ${d.toString().trim()}`));
 
-  proc.stdout.on('data', (d) => logger.debug(`[EMU-${emulatorPort}] ${d.toString().trim()}`));
-  proc.stderr.on('data', (d) => logger.debug(`[EMU-${emulatorPort}] ${d.toString().trim()}`));
-
-  proc.on('exit', (code) => {
-    logger.warn(`[AVD] Emulador ${avdName} encerrado com código ${code}`);
-    runningProcesses.delete(instanceId);
+  await new Promise((resolve, reject) => {
+    proc.on('exit',  code => code === 0 ? resolve() : reject(new Error(`docker run falhou (code ${code})`)));
+    proc.on('error', reject);
   });
 
+  containerId = containerId.trim().slice(0, 12);
+  logger.info(`[Redroid] Container iniciado: ${cname} (${containerId}), ADB 127.0.0.1:${adbPort}`);
+  runningProcesses.set(instanceId, { containerId: cname, adbPort });
   return proc;
 }
 
-// ─── Parar Emulador ───────────────────────────────────────────────────────────
-async function stopEmulator(instanceId, emulatorPort) {
-  const adbSerial = `emulator-${emulatorPort}`;
-  logger.info(`[AVD] Parando emulador ${adbSerial}...`);
-
+// ─── Stop Container ───────────────────────────────────────────────────────────
+async function stopEmulator(instanceId, adbPort) {
+  const adbSerial = `127.0.0.1:${adbPort}`;
+  logger.info(`[Redroid] Parando container ${adbSerial}...`);
   try {
-    await execAsync(`${ADB} -s ${adbSerial} emu kill`, {
-      env: getEnv(), timeout: 15000,
-    });
-  } catch (_) { /* pode já estar morto */ }
-
-  const proc = runningProcesses.get(instanceId);
-  if (proc) {
-    try { proc.kill('SIGTERM'); } catch (_) {}
-    runningProcesses.delete(instanceId);
-  }
-  logger.info(`[AVD] Emulador ${adbSerial} parado.`);
+    await execAsync(`${ADB} -s ${adbSerial} shell reboot -p 2>/dev/null || true`, { timeout: 8000 });
+  } catch (_) {}
+  const cname = containerName(instanceId);
+  try {
+    await execAsync(`docker stop ${cname} 2>/dev/null || true`);
+    await execAsync(`docker rm   ${cname} 2>/dev/null || true`);
+  } catch (_) {}
+  try { await execAsync(`${ADB} disconnect ${adbSerial}`, { timeout: 5000 }); } catch (_) {}
+  runningProcesses.delete(instanceId);
+  logger.info(`[Redroid] Container ${cname} parado.`);
 }
 
-// ─── Aplicar Build.prop (Spoofing) ────────────────────────────────────────────
-async function applyBuildPropSpoofing(emulatorPort, profile) {
-  const adbSerial = `emulator-${emulatorPort}`;
-  logger.info(`[SPOOF] Injetando build.prop no emulador ${adbSerial}...`);
+// ─── Build prop spoofing (runtime writable props only) ────────────────────────
+async function applyBuildPropSpoofing(adbPort, profile) {
+  // ro.* props are already set via docker run CMD args at container start
+  // This function handles only runtime-writable props (gsm.*, debug.*, etc.)
+  const adbSerial = `127.0.0.1:${adbPort}`;
+  logger.info(`[Spoof] Props ro.* já injetadas via docker args em ${adbSerial}`);
 
-  // Remonta /system como leitura-escrita
   try {
-    await execAsync(`${ADB} -s ${adbSerial} root`, { env: getEnv(), timeout: 10000 });
-    await new Promise((r) => setTimeout(r, 2000));
-    await execAsync(`${ADB} -s ${adbSerial} remount`, { env: getEnv(), timeout: 10000 });
-  } catch (e) {
-    logger.warn(`[SPOOF] remount falhou (pode ser normal): ${e.message}`);
-  }
+    await execAsync(`${ADB} -s ${adbSerial} root`, { timeout: 10000 });
+    await new Promise(r => setTimeout(r, 1500));
+  } catch (_) {}
 
-  const props = profile.buildProps || {};
-  const cmds = Object.entries(props).map(
-    ([k, v]) => `${ADB} -s ${adbSerial} shell "setprop ${k} '${v}'"`
-  );
+  // Only set runtime-writable props here
+  const runtimeProps = {
+    'gsm.operator.alpha': profile.networkOperator || 'Android',
+    'gsm.network.type':   'LTE',
+    'gsm.sim.state':      'READY',
+    'gsm.operator.numeric': '72404',
+  };
 
-  for (const cmd of cmds) {
+  for (const [k, v] of Object.entries(runtimeProps)) {
     try {
-      await execAsync(cmd, { env: getEnv(), timeout: 8000 });
+      await execAsync(`${ADB} -s ${adbSerial} shell "setprop '${k}' '${v}'"`, { timeout: 8000 });
     } catch (e) {
-      logger.warn(`[SPOOF] setprop falhou: ${e.message}`);
+      logger.warn(`[Spoof] setprop ${k}: ${e.message}`);
     }
   }
-
-  logger.info(`[SPOOF] Build.prop aplicado para ${adbSerial}.`);
+  logger.info(`[Spoof] Runtime props aplicados em ${adbSerial}.`);
 }
 
-// ─── GPS Spoofing ─────────────────────────────────────────────────────────────
-async function setGPS(emulatorPort, lat, lng) {
-  return sendConsoleCommand(emulatorPort, `geo fix ${lng} ${lat}`);
-}
-
-// ─── Battery Spoofing ─────────────────────────────────────────────────────────
-async function setBattery(emulatorPort, level, status) {
-  const statusMap = { charging: 'charging', discharging: 'not-charging', full: 'full' };
-  const s = statusMap[status] || 'charging';
-  await sendConsoleCommand(emulatorPort, `power capacity ${level}`);
-  await sendConsoleCommand(emulatorPort, `power status ${s}`);
-}
-
-// ─── GSM Spoofing ─────────────────────────────────────────────────────────────
-async function setGSM(emulatorPort, { strength, operator }) {
-  if (strength !== undefined) {
-    await sendConsoleCommand(emulatorPort, `gsm signal ${strength}`);
-  }
-  if (operator) {
-    await sendConsoleCommand(emulatorPort, `gsm operator ${operator}`);
-  }
-}
-
-// ─── Injetar SMS ──────────────────────────────────────────────────────────────
-async function sendSMS(emulatorPort, from, message) {
-  return sendConsoleCommand(emulatorPort, `sms send ${from} "${message}"`);
-}
-
-// ─── Console Telnet ──────────────────────────────────────────────────────────
-function sendConsoleCommand(emulatorPort, command) {
-  return new Promise((resolve, reject) => {
-    const consolePort = emulatorPort; // porta de console = porta do emulador
-    const client = net.createConnection({ port: consolePort, host: '127.0.0.1' });
-    let buffer = '';
-    let authenticated = false;
-
-    const timeout = setTimeout(() => {
-      client.destroy();
-      reject(new Error(`Timeout no console do emulador (porta ${consolePort})`));
-    }, 10000);
-
-    client.on('connect', () => {
-      logger.debug(`[CONSOLE] Conectado ao emulador na porta ${consolePort}`);
-    });
-
-    client.on('data', (data) => {
-      buffer += data.toString();
-      // Aguarda o prompt "OK" antes de autenticar
-      if (!authenticated && buffer.includes('OK')) {
-        authenticated = true;
-        client.write(`auth $(cat ~/.emulator_console_auth_token 2>/dev/null || echo '')\n`);
-        setTimeout(() => {
-          client.write(`${command}\n`);
-        }, 200);
-      }
-      if (authenticated && buffer.includes('OK\r\n') && buffer.split('OK').length > 2) {
-        clearTimeout(timeout);
-        client.write('quit\n');
-        client.end();
-        resolve(buffer);
-      }
-    });
-
-    client.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-    client.on('close', () => {
-      clearTimeout(timeout);
-      resolve(buffer);
-    });
-  });
-}
-
-// ─── Wipe AVD Data ────────────────────────────────────────────────────────────
-async function wipeAVD(avdName) {
-  logger.info(`[AVD] Limpando dados do AVD ${avdName}...`);
-  const avdDir = path.join(AVD_HOME, `${avdName}.avd`);
-  const filesToDelete = ['userdata.img', 'userdata-qemu.img', 'cache.img', 'sdcard.img'];
-
-  for (const f of filesToDelete) {
-    const fp = path.join(avdDir, f);
-    if (fs.existsSync(fp)) {
-      fs.unlinkSync(fp);
-      logger.debug(`[AVD] Removido: ${fp}`);
-    }
-  }
-  logger.info(`[AVD] Wipe concluído para ${avdName}.`);
-}
-
-// ─── Excluir AVD ──────────────────────────────────────────────────────────────
-async function deleteAVD(avdName) {
-  logger.info(`[AVD] Excluindo AVD ${avdName}...`);
+// ─── GPS ──────────────────────────────────────────────────────────────────────
+async function setGPS(adbPort, lat, lng) {
+  const serial = `127.0.0.1:${adbPort}`;
   try {
-    await execAsync(`${AVDMANAGER} delete avd --name ${avdName}`, {
-      env: getEnv(), timeout: 30000,
-    });
+    // Enable mock locations
+    await execAsync(
+      `${ADB} -s ${serial} shell "settings put global development_settings_enabled 1"`,
+      { timeout: 8000 }
+    );
+    await execAsync(
+      `${ADB} -s ${serial} shell "settings put secure mock_location 1"`,
+      { timeout: 8000 }
+    );
+    // Broadcast mock location
+    await execAsync(
+      `${ADB} -s ${serial} shell "am broadcast -a android.intent.action.MOCK_LOCATION --ef lat ${lat} --ef lng ${lng}"`,
+      { timeout: 8000 }
+    );
+    logger.debug(`[GPS] ${serial} → ${lat},${lng}`);
   } catch (e) {
-    logger.warn(`[AVD] avdmanager delete falhou: ${e.message}`);
+    logger.warn(`[GPS] Erro em ${serial}: ${e.message}`);
   }
-
-  // Força remoção do diretório
-  const avdDir = path.join(AVD_HOME, `${avdName}.avd`);
-  if (fs.existsSync(avdDir)) {
-    fs.rmSync(avdDir, { recursive: true, force: true });
-  }
-  const iniFile = path.join(AVD_HOME, `${avdName}.ini`);
-  if (fs.existsSync(iniFile)) fs.unlinkSync(iniFile);
-
-  logger.info(`[AVD] AVD ${avdName} excluído.`);
 }
 
-// ─── Métricas do Emulador ─────────────────────────────────────────────────────
-async function getEmulatorMetrics(emulatorPort) {
-  const adbSerial = `emulator-${emulatorPort}`;
+// ─── Battery ──────────────────────────────────────────────────────────────────
+async function setBattery(adbPort, level, status) {
+  const serial = `127.0.0.1:${adbPort}`;
+  try {
+    await execAsync(`${ADB} -s ${serial} shell "dumpsys battery set level ${level}"`, { timeout: 8000 });
+    const plugged = (status === 'charging') ? 1 : 0;
+    await execAsync(`${ADB} -s ${serial} shell "dumpsys battery set ac ${plugged}"`, { timeout: 8000 });
+    await execAsync(`${ADB} -s ${serial} shell "dumpsys battery set status ${plugged ? 2 : 3}"`, { timeout: 8000 });
+    logger.debug(`[Battery] ${serial} → ${level}% ${status}`);
+  } catch (e) {
+    logger.warn(`[Battery] Erro em ${serial}: ${e.message}`);
+  }
+}
+
+// ─── GSM ──────────────────────────────────────────────────────────────────────
+async function setGSM(adbPort, { strength, operator }) {
+  const serial = `127.0.0.1:${adbPort}`;
+  try {
+    if (operator) {
+      await execAsync(`${ADB} -s ${serial} shell "setprop gsm.operator.alpha '${operator}'"`, { timeout: 8000 });
+      await execAsync(`${ADB} -s ${serial} shell "setprop gsm.sim.operator.alpha '${operator}'"`, { timeout: 8000 });
+    }
+    if (strength !== undefined) {
+      // signal strength: 0-4 mapped to dBm (-113 to -51)
+      const dbm = -113 + (strength * 16);
+      await execAsync(
+        `${ADB} -s ${serial} shell "am broadcast -a android.intent.action.PHONE_STATE --ei signal_strength ${dbm}"`,
+        { timeout: 8000 }
+      );
+    }
+    logger.debug(`[GSM] ${serial} → operador=${operator}, sinal=${strength}`);
+  } catch (e) {
+    logger.warn(`[GSM] Erro em ${serial}: ${e.message}`);
+  }
+}
+
+// ─── SMS injection ────────────────────────────────────────────────────────────
+async function sendSMS(adbPort, from, message) {
+  const serial = `127.0.0.1:${adbPort}`;
+  try {
+    await execAsync(
+      `${ADB} -s ${serial} shell "am broadcast -a android.provider.Telephony.SMS_RECEIVED --es from '${from}' --es body '${message}'"`,
+      { timeout: 8000 }
+    );
+    logger.debug(`[SMS] ${serial} ← de ${from}: ${message.substring(0, 30)}`);
+  } catch (e) {
+    logger.warn(`[SMS] Erro em ${serial}: ${e.message}`);
+  }
+}
+
+// ─── Console (no-op para Redroid) ─────────────────────────────────────────────
+function sendConsoleCommand(_port, _command) {
+  return Promise.resolve('');
+}
+
+// ─── Wipe: remove /data Docker volume ───────────────────────────────────────
+async function wipeAVD(avdName) {
+  logger.info(`[Redroid] Limpando ${avdName}...`);
+  const instanceId = avdName.replace('farm_', '').replace(/_/g, '-');
+  const volumeName = `redroid-data-${instanceId.replace(/-/g, '').slice(0, 12)}`;
+  try { await execAsync(`docker volume rm ${volumeName} 2>/dev/null || true`); } catch (_) {}
+  // Also clean host data dir if it exists (legacy)
+  const dataDir = path.join(FARM_DIR, 'instances', instanceId);
+  if (fs.existsSync(dataDir)) {
+    fs.rmSync(dataDir,  { recursive: true, force: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
+  logger.info(`[Redroid] Wipe concluído para ${avdName}`);
+}
+
+// ─── Delete ───────────────────────────────────────────────────────────────────
+async function deleteAVD(avdName) {
+  logger.info(`[Redroid] Deletando ${avdName}...`);
+  const instanceId = avdName.replace('farm_', '').replace(/_/g, '-');
+  const cname      = containerName(instanceId);
+  const volumeName = `redroid-data-${instanceId.replace(/-/g, '').slice(0, 12)}`;
+  try { await execAsync(`docker rm -f ${cname} 2>/dev/null || true`); } catch (_) {}
+  try { await execAsync(`docker volume rm ${volumeName} 2>/dev/null || true`); } catch (_) {}
+  const dataDir = path.join(FARM_DIR, 'instances', instanceId);
+  if (fs.existsSync(dataDir)) fs.rmSync(dataDir, { recursive: true, force: true });
+  logger.info(`[Redroid] ${avdName} deletado.`);
+}
+
+// ─── Metrics ──────────────────────────────────────────────────────────────────
+async function getEmulatorMetrics(adbPort) {
+  const serial = `127.0.0.1:${adbPort}`;
   try {
     const { stdout: cpu } = await execAsync(
-      `${ADB} -s ${adbSerial} shell "top -bn1 | grep 'Cpu\\|cpu'"`,
-      { env: getEnv(), timeout: 8000 }
-    );
+      `${ADB} -s ${serial} shell "top -bn1 | grep -i cpu"`, { timeout: 8000 });
     const { stdout: mem } = await execAsync(
-      `${ADB} -s ${adbSerial} shell "free -m | grep Mem"`,
-      { env: getEnv(), timeout: 8000 }
-    );
+      `${ADB} -s ${serial} shell "free -m | grep Mem"`,      { timeout: 8000 });
     return { cpu: cpu.trim(), mem: mem.trim() };
   } catch (_) {
     return { cpu: 'N/A', mem: 'N/A' };

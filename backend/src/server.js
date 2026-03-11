@@ -1,6 +1,6 @@
 /**
  * Android Device Farm — Main Server
- * Express + Socket.IO + WebSocket Bridge
+ * Express + Socket.IO + WebSocket Bridge (ws-scrcpy)
  */
 require('dotenv').config();
 const http = require('http');
@@ -16,6 +16,7 @@ const instanceRoutes = require('./routes/instanceRoutes');
 const profileRoutes = require('./routes/profileRoutes');
 const systemRoutes = require('./routes/systemRoutes');
 const { initSocketHandlers } = require('./services/socketService');
+const { startWsScrcpy } = require('./services/wsScrcpyService');
 
 const app = express();
 const server = http.createServer(app);
@@ -56,8 +57,9 @@ app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    version: '1.0.0',
+    version: '2.0.0',
     service: 'Android Device Farm',
+    wsScrcpy: `ws://0.0.0.0:${process.env.WS_SCRCPY_BASE_PORT || 8886}/ws-scrcpy?serial=<adb-serial>`,
   });
 });
 
@@ -67,6 +69,13 @@ app.use(errorHandler);
 
 // ── Socket Handlers ───────────────────────────────────────────────────────────
 initSocketHandlers(io);
+
+// ── ws-scrcpy WebSocket Server (attached to HTTP server on /ws-scrcpy) ───────
+const WS_SCRCPY_PORT = parseInt(process.env.WS_SCRCPY_BASE_PORT || '8886', 10);
+// Start as standalone WebSocket server on dedicated port 8886
+startWsScrcpy(null, WS_SCRCPY_PORT);
+logger.info(`📱 ws-scrcpy listening on ws://0.0.0.0:${WS_SCRCPY_PORT}`);
+logger.info(`   Usage: ws://<host>:${WS_SCRCPY_PORT}?serial=127.0.0.1:5554`);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -87,3 +96,4 @@ process.on('SIGINT', () => {
 });
 
 module.exports = { app, server, io };
+

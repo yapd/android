@@ -98,21 +98,28 @@ const startInstance = asyncHandler(async (req, res) => {
       const port = inst.emulatorPort || await avdService.findFreePort();
       store.update(inst.id, { emulatorPort: port });
 
-      const proc = await avdService.startEmulator(inst.id, inst.avdName, port);
+      // Pass profile so startEmulator injects ro.* props as docker run args
+      const proc = await avdService.startEmulator(inst.id, inst.avdName, port, inst.profile);
       store.update(inst.id, { pid: proc.pid, status: 'starting' });
 
       await avdService.waitForEmulatorBoot(port);
 
-      // Aplica spoofing de build.prop
+      // Verify/log injected props (ro.* already set at container start)
       if (inst.profile) {
         await avdService.applyBuildPropSpoofing(port, inst.profile);
       }
 
-      // Aplica GPS inicial
+      // Apply GPS
       await avdService.setGPS(port, inst.gpsLat, inst.gpsLng).catch(() => {});
 
-      // Aplica bateria inicial
+      // Apply battery
       await avdService.setBattery(port, inst.batteryLevel, inst.batteryStatus).catch(() => {});
+
+      // Apply GSM operator
+      await avdService.setGSM(port, {
+        strength: inst.networkStrength,
+        operator: inst.networkOperator,
+      }).catch(() => {});
 
       store.update(inst.id, { status: 'running', lastStartedAt: new Date().toISOString() });
       emitInstanceUpdate(inst.id, store.getById(inst.id));
@@ -165,11 +172,15 @@ const rebootInstance = asyncHandler(async (req, res) => {
 
       await new Promise((r) => setTimeout(r, 3000));
 
-      const proc = await avdService.startEmulator(inst.id, inst.avdName, inst.emulatorPort);
+      const proc = await avdService.startEmulator(inst.id, inst.avdName, inst.emulatorPort, inst.profile);
       store.update(inst.id, { pid: proc.pid });
       await avdService.waitForEmulatorBoot(inst.emulatorPort);
 
       if (inst.profile) await avdService.applyBuildPropSpoofing(inst.emulatorPort, inst.profile);
+      await avdService.setGSM(inst.emulatorPort, {
+        strength: inst.networkStrength,
+        operator: inst.networkOperator,
+      }).catch(() => {});
 
       store.update(inst.id, { status: 'running', lastStartedAt: new Date().toISOString() });
       emitInstanceUpdate(inst.id, store.getById(inst.id));
