@@ -9,23 +9,23 @@
     "lint": "eslint src/"
   },
   "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.1",
     "express": "^4.18.2",
     "express-async-handler": "^1.2.0",
-    "cors": "^2.8.5",
     "helmet": "^7.1.0",
-    "morgan": "^1.10.0",
-    "ws": "^8.16.0",
-    "socket.io": "^4.7.2",
-    "uuid": "^9.0.0",
-    "dotenv": "^16.4.1",
     "joi": "^17.12.0",
-    "winston": "^3.11.0",
+    "morgan": "^1.10.0",
     "node-schedule": "^2.1.1",
+    "socket.io": "^4.7.2",
     "systeminformation": "^5.21.20",
+    "uuid": "^9.0.0",
+    "winston": "^3.11.0",
+    "ws": "^8.19.0",
     "xterm": "^5.3.0"
   },
   "devDependencies": {
-    "nodemon": "^3.0.3",
-    "eslint": "^8.56.0"
+    "eslint": "^8.56.0",
+    "nodemon": "^3.0.3"
   }
 }

@@ -1,0 +1,17 @@
+[Unit]
+Description=Android Device Farm (Redroid + Node.js API)
+After=network.target docker.service
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/android-farm/startup.sh
+ExecStop=/bin/bash -c 'docker stop $(docker ps -q --filter name=redroid-farm) 2>/dev/null; pm2 stop android-farm-api 2>/dev/null; pm2 stop ws-scrcpy 2>/dev/null; true'
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
